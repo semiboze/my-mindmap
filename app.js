@@ -193,6 +193,7 @@ function clearDrop() {
 function clearDrag() {
   const restoreLayout = pointer?.moved && pointer?.reorderParentId != null;
   pointer?.ghost?.remove();
+  pointer?.originMarker?.remove();
   for (const zone of pointer?.reorderZones || []) zone.remove();
   pointer = null;
   canvas.classList.remove('is-panning');
@@ -237,12 +238,14 @@ function showReorderZones() {
   const branch = infoFor(pointer.id);
   if (!branch?.parent) return;
   const view = canvas.getBoundingClientRect();
-  const siblings = children(branch.parent).filter(entry =>
-    (!isRoot(branch.parent.id) || entry.side === branch.side) && !sameId(entry.node.id, pointer.id));
+  const sideSiblings = children(branch.parent).filter(entry =>
+    !isRoot(branch.parent.id) || entry.side === branch.side);
+  const originIndex = sideSiblings.findIndex(entry => sameId(entry.node.id, pointer.id));
+  const siblings = sideSiblings.filter(entry => !sameId(entry.node.id, pointer.id));
   const nodeElements = Array.from(nodesLayer.children);
   const rects = nodeElements.map(el => el.getBoundingClientRect());
   pointer.reorderZones = [];
-  for (const sibling of siblings) {
+  for (const [siblingIndex, sibling] of siblings.entries()) {
     const el = nodeElements.find(item => sameId(item._nodeId, sibling.node.id));
     if (!el) continue;
     const rect = el.getBoundingClientRect();
@@ -254,8 +257,10 @@ function showReorderZones() {
           rects.some(r => rect.left < r.right && rect.right > r.left && top < r.bottom && bottom > r.top)) continue;
       const zone = document.createElement('div');
       zone.className = 'reorder-zone';
-      zone.textContent = rect.width >= 70 ? 'ここに挿入' : '＋';
-      zone.title = kind === 'before' ? 'このノードの前に挿入' : 'このノードの後に挿入';
+      const isOrigin = originIndex >= 0 && siblingIndex + (kind === 'after' ? 1 : 0) === originIndex;
+      if (isOrigin) zone.classList.add('reorder-origin');
+      zone.textContent = isOrigin ? (rect.width >= 70 ? '元の位置' : '元') : (rect.width >= 70 ? 'ここに挿入' : '＋');
+      zone.title = isOrigin ? '元の位置（順序は変わりません）' : (kind === 'before' ? 'このノードの前に挿入' : 'このノードの後に挿入');
       zone._targetId = sibling.node.id; zone._kind = kind;
       zone.style.left = `${Math.max(view.left, rect.left)}px`;
       zone.style.top = `${top}px`;
@@ -265,6 +270,20 @@ function showReorderZones() {
       pointer.reorderZones.push(zone);
     }
   }
+}
+function showDragOrigin(rect) {
+  const view = canvas.getBoundingClientRect();
+  const left = Math.max(view.left, rect.left), right = Math.min(view.right, rect.right);
+  const top = Math.max(view.top, rect.top), bottom = Math.min(view.bottom, rect.bottom);
+  if (left >= right || top >= bottom) return null;
+  const marker = document.createElement('div');
+  marker.className = 'drag-origin-marker';
+  marker.textContent = '元の位置';
+  marker.setAttribute('aria-hidden', 'true');
+  marker.style.left = `${left}px`; marker.style.top = `${top}px`;
+  marker.style.width = `${right - left}px`; marker.style.height = `${bottom - top}px`;
+  document.body.appendChild(marker);
+  return marker;
 }
 function onNodeDown(event) {
   if (event.button !== 0 || !doc) return;
@@ -283,6 +302,7 @@ function onNodeDown(event) {
   const info = infoFor(el._nodeId);
   pointer = { type: 'node', id: el._nodeId, el, startX: event.clientX, startY: event.clientY,
     offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top, moved: false, ghost: null,
+    originRect: { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom }, originMarker: null,
     reorderParentId: info?.parent?.id ?? null, reorderSide: info?.side };
 }
 canvas.addEventListener('pointerdown', event => {
@@ -296,6 +316,7 @@ window.addEventListener('pointermove', event => {
   if (readOnly() || isRoot(pointer.id)) return;
   if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) < 5 && !pointer.moved) return;
   if (!pointer.moved) {
+    pointer.originMarker = showDragOrigin(pointer.originRect);
     pointer.ghost = document.createElement('div');
     pointer.ghost.className = 'node drag-ghost';
     pointer.ghost.textContent = findNode(doc, pointer.id)?.title || '（空のノード）';
@@ -319,6 +340,10 @@ window.addEventListener('pointermove', event => {
   const rect = el.getBoundingClientRect(), target = infoFor(el._nodeId);
   if (!target) return;
   const dragged = findNode(doc, pointer.id);
+  if (dragged && sameId(dragged.id, target.node.id)) {
+    $('hint').textContent = '元の位置です';
+    return;
+  }
   if (!dragged || isWithinBranch(dragged, target.node.id)) {
     el.classList.add('drop-invalid');
     $('hint').textContent = '自分自身やその子孫には移動できません';
