@@ -3,6 +3,8 @@ import { parseMap, serializeMap, getRoot, children, findNode, addNode, setTitle,
 const $ = id => document.getElementById(id);
 const canvas = $('canvas'), world = $('world'), nodesLayer = $('nodes'), lines = $('lines');
 let doc = null, filename = '', savedSnapshot = '', selectedId = null;
+let activeFileHandle = null, fileRevision = null, saveInProgress = false;
+let openInProgress = false, openSequence = 0, pendingFallback = null;
 let undoStack = [], redoStack = [], scale = 1, panX = 0, panY = 0, bounds = null;
 let dialogAction = null, inlineDraft = null, pointer = null, drop = null, toastTimer;
 const CARD_WIDTH = 220, LEVEL_GAP = 82, V_GAP = 22;
@@ -38,12 +40,16 @@ function infoFor(id) {
   return visit(root, null, 'right');
 }
 function updateControls() {
-  const selected = !!selection() && !readOnly(), root = selected && isRoot(selectedId);
-  $('save').disabled = !doc; $('undo').disabled = !undoStack.length; $('redo').disabled = !redoStack.length;
+  const selected = !!selection() && !readOnly() && !openInProgress, root = selected && isRoot(selectedId);
+  $('save').disabled = !doc || saveInProgress || openInProgress;
+  $('overwrite').disabled = !doc || !activeFileHandle || readOnly() || saveInProgress || openInProgress;
+  $('overwrite').title = activeFileHandle ? '開いたファイルに上書き保存' : '上書き保存には対応ブラウザでファイルを開き直してください';
+  $('open').disabled = saveInProgress || openInProgress; $('open-empty').disabled = saveInProgress || openInProgress;
+  $('undo').disabled = !undoStack.length || openInProgress; $('redo').disabled = !redoStack.length || openInProgress;
   $('add-child').disabled = !selected; $('add-sibling').disabled = !selected || root;
   $('edit').disabled = !selected; $('delete').disabled = !selected || root;
   $('filename').textContent = doc ? filename : 'ファイルが選択されていません';
-  $('save-state').textContent = readOnly() ? '未対応のリンクがあるため閲覧のみ' : doc ? (dirty() ? '未保存の変更があります' : '元のファイルは変更しません') : '元のファイルは変更しません';
+  $('save-state').textContent = saveInProgress ? '保存中…' : openInProgress ? '読み込み中…' : readOnly() ? '未対応のリンクがあるため閲覧のみ' : doc ? (dirty() ? '未保存の変更があります' : activeFileHandle ? '変更なし' : '元ファイルは変更しません') : 'ファイルを開いてください';
   $('hint').textContent = readOnly() ? '閲覧のみ ・ 背景ドラッグで画面を移動' : doc ? 'ノードに重ねると子になります ・ 背景ドラッグで画面を移動' : 'ファイルを開いて始めましょう';
 }
 function choose(id) {
@@ -52,7 +58,7 @@ function choose(id) {
   updateControls();
 }
 function mutate(fn) {
-  if (!doc) return;
+  if (!doc || openInProgress) return;
   const old = snapshot();
   try {
     const result = fn();
@@ -65,6 +71,7 @@ function mutate(fn) {
   }
 }
 function undo() {
+  if (openInProgress) return;
   if (pointer) clearDrag();
   if (inlineDraft) finishInlineDraft();
   if (!undoStack.length) return;
@@ -73,6 +80,7 @@ function undo() {
   render(); updateControls();
 }
 function redo() {
+  if (openInProgress) return;
   if (pointer) clearDrag();
   if (inlineDraft) finishInlineDraft();
   if (!redoStack.length) return;
@@ -185,12 +193,73 @@ function zoom(factor, cx = canvas.clientWidth / 2, cy = canvas.clientHeight / 2)
   panX = cx - (cx - panX) * next / scale; panY = cy - (cy - panY) * next / scale; scale = next; setTransform();
 }
 
+// During a drag, move the map when the pointer remains near the canvas edge.
+// The animation belongs to a specific pointer state and never edits the map.
+let dragPanFrameId = null;
+let dragPanLastTime = null;
+const DRAG_PAN_EDGE = 48, DRAG_PAN_SPEED = 360, DRAG_PAN_MIN_VISIBLE = 36;
+function stopDragPan() {
+  if (dragPanFrameId !== null) cancelAnimationFrame(dragPanFrameId);
+  dragPanFrameId = null;
+  dragPanLastTime = null;
+}
+function dragPanVelocity(value, low, high) {
+  const edge = Math.min(DRAG_PAN_EDGE, (high - low) / 4);
+  if (edge <= 0 || value < low || value > high) return 0;
+  if (value < low + edge) return DRAG_PAN_SPEED * (low + edge - value) / edge;
+  if (value > high - edge) return -DRAG_PAN_SPEED * (value - high + edge) / edge;
+  return 0;
+}
+function dragPanDirection(state) {
+  if (!state || pointer !== state || state.type !== 'node' || !state.moved) return null;
+  const view = canvas.getBoundingClientRect(), {lastX: x, lastY: y} = state;
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < view.left || x > view.right || y < view.top || y > view.bottom) return null;
+  const point = document.elementFromPoint(x, y);
+  // Don't pan while hovering the floating toolbar or any other control.
+  if (!point || !canvas.contains(point)) return null;
+  const vx = dragPanVelocity(x, view.left, view.right);
+  const vy = dragPanVelocity(y, view.top, view.bottom);
+  return vx || vy ? {vx, vy, view} : null;
+}
+function dragPanClamped(current, delta, min, max) {
+  // If the user had already panned beyond the limits, never jump their view.
+  if (delta < 0 && current <= min || delta > 0 && current >= max) return current;
+  if (current < min || current > max) return current + delta;
+  return Math.max(min, Math.min(max, current + delta));
+}
+function scheduleDragPan() {
+  if (dragPanFrameId !== null || !dragPanDirection(pointer)) return;
+  const state = pointer;
+  dragPanFrameId = requestAnimationFrame(time => {
+    dragPanFrameId = null;
+    if (pointer !== state) return;
+    const direction = dragPanDirection(state);
+    if (!direction || !bounds) { dragPanLastTime = null; return; }
+    if (dragPanLastTime !== null && time - dragPanLastTime < 30) { scheduleDragPan(); return; }
+    const dt = dragPanLastTime === null ? 0 : Math.min(0.05, Math.max(0, (time - dragPanLastTime) / 1000));
+    dragPanLastTime = time;
+    const margin = DRAG_PAN_MIN_VISIBLE, view = direction.view;
+    const nextX = dragPanClamped(panX, direction.vx * dt, margin - bounds.maxX * scale, view.width - margin - bounds.minX * scale);
+    const nextY = dragPanClamped(panY, direction.vy * dt, margin - bounds.maxY * scale, view.height - margin - bounds.minY * scale);
+    if (nextX !== panX || nextY !== panY) {
+      panX = nextX; panY = nextY; setTransform();
+      for (const zone of state.reorderZones || []) zone.remove();
+      state.reorderZones = [];
+      showReorderZones();
+      updateDragHover(state.lastX, state.lastY);
+    }
+    else if (dt > 0) { dragPanLastTime = null; return; }
+    if (pointer === state) scheduleDragPan();
+  });
+}
+
 function clearDrop() {
   for (const el of nodesLayer.children) el.classList.remove('drop-child', 'drop-before', 'drop-after', 'drop-invalid', 'dragging');
   for (const zone of pointer?.reorderZones || []) zone.classList.remove('active');
   drop = null;
 }
 function clearDrag() {
+  stopDragPan();
   const restoreLayout = pointer?.moved && pointer?.reorderParentId != null;
   pointer?.ghost?.remove();
   for (const zone of pointer?.reorderZones || []) zone.remove();
@@ -207,6 +276,7 @@ function dragTarget(x, y) {
   const view = canvas.getBoundingClientRect();
   if (x < view.left || x > view.right || y < view.top || y > view.bottom) return null;
   const point = document.elementFromPoint(x, y);
+  if (!point) return null;
   const zone = point?.closest('.reorder-zone');
   if (zone && pointer.reorderZones?.includes(zone)) {
     const el = Array.from(nodesLayer.children).find(item => sameId(item._nodeId, zone._targetId));
@@ -218,6 +288,9 @@ function dragTarget(x, y) {
     const rect = hit.getBoundingClientRect();
     if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return { el: hit, kind: 'child' };
   }
+  // The canvas can be covered by the toolbar or other controls.  Do not
+  // interpret a drop on those controls as a drop on the map underneath.
+  if (!canvas.contains(point)) return null;
   // Keep sibling reordering available in a small gap immediately outside a card.
   let best = null;
   for (const el of nodesLayer.children) {
@@ -230,7 +303,34 @@ function dragTarget(x, y) {
       best = { el, kind: before >= 0 ? 'before' : 'after', distance };
     }
   }
-  return best;
+  // On blank canvas, allow the *visible drag preview* to be dropped onto a
+  // node even if the mouse pointer is just outside it.  Require substantial
+  // overlap of both rectangles, and never guess between multiple matches.
+  const dragged = findNode(doc, pointer.id);
+  const original = infoFor(pointer.id);
+  const preview = pointer.ghost?.getBoundingClientRect();
+  if (!dragged || !original || !preview || preview.width <= 0 || preview.height <= 0) return null;
+  const candidates = [];
+  for (const el of nodesLayer.children) {
+    const target = findNode(doc, el._nodeId);
+    if (!target || isWithinBranch(dragged, target.id) || target === original.parent) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    const left = Math.max(preview.left, rect.left, view.left);
+    const right = Math.min(preview.right, rect.right, view.right);
+    const top = Math.max(preview.top, rect.top, view.top);
+    const bottom = Math.min(preview.bottom, rect.bottom, view.bottom);
+    const area = Math.max(0, right - left) * Math.max(0, bottom - top);
+    if (area < rect.width * rect.height * 0.5 || area < preview.width * preview.height * 0.5) continue;
+    // Ignore a node hidden by a toolbar or another element at its centre.
+    const cx = (Math.max(rect.left, view.left) + Math.min(rect.right, view.right)) / 2;
+    const cy = (Math.max(rect.top, view.top) + Math.min(rect.bottom, view.bottom)) / 2;
+    const visible = document.elementFromPoint(cx, cy);
+    if (!visible || !el.contains(visible)) continue;
+    candidates.push(el);
+    if (candidates.length > 1) return null;
+  }
+  return candidates.length === 1 ? { el: candidates[0], kind: 'child', overlap: true } : best;
 }
 
 function showReorderZones() {
@@ -273,7 +373,7 @@ function showReorderZones() {
   }
 }
 function onNodeDown(event) {
-  if (event.button !== 0 || !doc) return;
+  if (event.button !== 0 || !doc || openInProgress) return;
   event.stopPropagation();
   let el = event.currentTarget;
   if (inlineDraft) {
@@ -320,11 +420,18 @@ window.addEventListener('pointermove', event => {
       showReorderZones();
     }
   }
-  pointer.moved = true; clearDrop(); pointer.el.classList.add('dragging');
-  pointer.ghost.style.left = `${event.clientX - pointer.offsetX}px`;
-  pointer.ghost.style.top = `${event.clientY - pointer.offsetY}px`;
+  pointer.moved = true;
+  pointer.lastX = event.clientX; pointer.lastY = event.clientY;
+  updateDragHover(event.clientX, event.clientY);
+  if (dragPanDirection(pointer)) scheduleDragPan(); else stopDragPan();
+});
+function updateDragHover(x, y) {
+  clearDrop(); pointer.el.classList.add('dragging');
+  pointer.overOriginal = false;
+  pointer.ghost.style.left = `${x - pointer.offsetX}px`;
+  pointer.ghost.style.top = `${y - pointer.offsetY}px`;
   $('hint').textContent = 'ノードに重ねると子に移動 ・「ここに挿入」で順序を変更 ・ Escで中止';
-  const hit = dragTarget(event.clientX, event.clientY);
+  const hit = dragTarget(x, y);
   if (!hit) return;
   const { el, kind } = hit;
   hit.zone?.classList.add('active');
@@ -332,6 +439,7 @@ window.addEventListener('pointermove', event => {
   if (!target) return;
   const dragged = findNode(doc, pointer.id);
   if (dragged && sameId(dragged.id, target.node.id)) {
+    pointer.overOriginal = true;
     $('hint').textContent = '元の位置です';
     return;
   }
@@ -341,21 +449,28 @@ window.addEventListener('pointermove', event => {
     return;
   }
   let side = target.side;
-  if (isRoot(target.node.id)) side = event.clientX < rect.left + rect.width / 2 ? 'left' : 'right';
+  if (isRoot(target.node.id)) side = x < rect.left + rect.width / 2 ? 'left' : 'right';
   drop = { targetId: target.node.id, kind, side };
   el.classList.add(`drop-${kind}`);
-});
+}
 window.addEventListener('pointerup', () => {
   if (!pointer) return;
   const current = pointer, destination = drop;
   clearDrag();
-  if (current.type !== 'node' || !current.moved || !destination) return;
+  if (current.type !== 'node' || !current.moved) return;
+  if (!destination) {
+    if (!current.overOriginal) notice('移動先を選べませんでした。ノードまたは挿入枠に重ねてください。');
+    return;
+  }
   const target = infoFor(destination.targetId);
   if (!target) return;
   const parent = destination.kind === 'child' ? target.node : target.parent;
   if (!parent) return;
   const original = infoFor(current.id);
-  if (destination.kind === 'child' && original?.parent === parent && (!isRoot(parent.id) || original.side === destination.side)) return;
+  if (destination.kind === 'child' && original?.parent === parent && (!isRoot(parent.id) || original.side === destination.side)) {
+    notice('すでにこのノードの子になっています。');
+    return;
+  }
   const side = isRoot(parent.id) ? (destination.kind === 'child' ? destination.side : target.side) : target.side;
   const peers = children(parent).filter(entry => (!isRoot(parent.id) || entry.side === side) && !sameId(entry.node.id, current.id));
   const index = destination.kind === 'child' ? peers.length : Math.max(0, peers.findIndex(entry => sameId(entry.node.id, target.node.id))) + (destination.kind === 'after' ? 1 : 0);
@@ -390,6 +505,7 @@ function showInlineDraft() {
   input.focus({ preventScroll: true });
 }
 function beginInlineDraft(kind) {
+  if (openInProgress) return;
   if (readOnly()) { notice('未対応のノード間リンクがあるため編集できません。'); return; }
   if (inlineDraft) finishInlineDraft();
   const current = selection(); if (!current || (kind === 'sibling' && isRoot(current.id))) return;
@@ -465,7 +581,7 @@ $('edit-dialog').querySelector('form').addEventListener('submit', event => {
 });
 for (const id of ['close-dialog', 'cancel-dialog']) $(id).addEventListener('click', () => { dialogAction = null; $('edit-dialog').close(); });
 function removeSelected() {
-  if (readOnly()) return;
+  if (readOnly() || openInProgress) return;
   const node = selection(); if (!node || isRoot(node.id)) return;
   const info = infoFor(node.id), count = (function count(n) { return 1 + children(n).reduce((s, c) => s + count(c.node), 0); })(node);
   if (!confirm(count > 1 ? `このノードと、その下の ${count - 1} 個のノードを削除しますか？` : 'このノードを削除しますか？')) return;
@@ -473,26 +589,132 @@ function removeSelected() {
   if (mutate(() => deleteNode(doc, node.id))) choose(parentId);
 }
 
-function openFilePicker() {
+function editingState() {
+  return JSON.stringify({ document: doc, draft: inlineDraft ? { id: inlineDraft.id, value: inlineDraft.value } : null });
+}
+async function loadFile(file, handle = null, request = null) {
+  const text = await file.text();
+  const loaded = parseMap(text);
+  // A slow picker or Drive read must not silently discard edits made meanwhile.
+  if (request && (request.sequence !== openSequence || request.before !== editingState())) {
+    if (request.sequence === openSequence) saveProblem('読み込み中にマップが変更されたため、ファイルの切り替えを中止しました。編集内容を保存してから開き直してください。');
+    return false;
+  }
+  // Any drag started while reading still references the previous map's DOM.
+  if (pointer) clearDrag();
+  doc = loaded; filename = file.name; selectedId = getRoot(doc).id;
+  activeFileHandle = handle;
+  fileRevision = handle ? { text, size: file.size, lastModified: file.lastModified } : null;
+  savedSnapshot = snapshot(); undoStack = []; redoStack = [];
+  render(); updateControls(); requestAnimationFrame(fit);
+  if (readOnly()) notice('未対応のノード間リンクがあるため、このファイルは閲覧のみです。');
+  else notice('ファイルを開きました。');
+  return true;
+}
+async function openFilePicker() {
+  if (saveInProgress || openInProgress) return;
   if (pointer) clearDrag();
   if (inlineDraft) finishInlineDraft();
   if (dirty() && !confirm('未保存の変更があります。別のファイルを開きますか？')) return;
-  $('file').value = ''; $('file').click();
+  const request = { sequence: ++openSequence, before: editingState() };
+  function useFallback() {
+    pendingFallback = request;
+    $('file').value = ''; $('file').click();
+  }
+  if (typeof window.showOpenFilePicker === 'function') {
+    openInProgress = true; updateControls();
+    try {
+      // No extension filter: existing MindMup files may have no extension.
+      let handles;
+      try { handles = await window.showOpenFilePicker({ multiple: false }); }
+      catch (error) {
+        if (error?.name === 'AbortError') return;
+        if (error?.name === 'SecurityError' || error?.name === 'NotAllowedError') {
+          notice('この画面では別名保存用の方法でファイルを開きます。');
+          useFallback(); return;
+        }
+        throw error;
+      }
+      if (!handles?.length) return;
+      await loadFile(await handles[0].getFile(), handles[0], request);
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      notice(error?.message || 'ファイルを開けませんでした。');
+    } finally {
+      openInProgress = false; updateControls();
+    }
+    return;
+  }
+  useFallback();
 }
 for (const id of ['open', 'open-empty']) $(id).addEventListener('click', openFilePicker);
 $('file').addEventListener('change', async event => {
   const file = event.target.files?.[0]; if (!file) return;
+  const request = pendingFallback; pendingFallback = null;
+  if (!request || request.sequence !== openSequence || openInProgress || saveInProgress) return;
+  openInProgress = true; updateControls();
   try {
-    const loaded = parseMap(await file.text());
-    doc = loaded; filename = file.name; selectedId = getRoot(doc).id;
-    savedSnapshot = snapshot(); undoStack = []; redoStack = [];
-    render(); updateControls(); requestAnimationFrame(fit);
-    if (readOnly()) notice('未対応のノード間リンクがあるため、このファイルは閲覧のみです。');
-    else notice('ファイルを開きました。');
+    await loadFile(file, null, request);
   } catch (error) { notice(error.message || 'ファイルを開けませんでした。'); }
+  finally { openInProgress = false; updateControls(); }
 });
+function saveProblem(message) {
+  notice(message);
+  if (typeof window.alert === 'function') window.alert(message);
+}
+async function overwriteFile() {
+  if (!doc || saveInProgress || openInProgress || readOnly()) return;
+  if (!activeFileHandle || !fileRevision) {
+    notice('上書き保存には、対応ブラウザでファイルを開き直してください。');
+    return;
+  }
+  if (pointer) clearDrag();
+  if (inlineDraft) finishInlineDraft();
+  const handle = activeFileHandle, expected = fileRevision;
+  // Capture what will actually be written; edits made during async I/O remain unsaved.
+  const writtenSnapshot = snapshot(), text = serializeMap(doc);
+  saveInProgress = true; updateControls();
+  let writable = null;
+  try {
+    const permission = await handle.requestPermission({ mode: 'readwrite' });
+    if (permission !== 'granted') {
+      saveProblem('書き込みが許可されなかったため、上書きできません。別名で保存も利用できます。');
+      return;
+    }
+    const current = await handle.getFile(), currentText = await current.text();
+    if (currentText !== expected.text || current.size !== expected.size || current.lastModified !== expected.lastModified) {
+      saveProblem('ファイルが外部で変更されたため、上書きを中止しました。必要なら別名で保存し、元ファイルを確認してください。');
+      return;
+    }
+    writable = await handle.createWritable();
+    await writable.write(text);
+    // Staged writes are not committed until close. Recheck immediately before
+    // that commit so another editor's changes during write are not discarded.
+    const beforeClose = await handle.getFile(), beforeCloseText = await beforeClose.text();
+    if (beforeCloseText !== expected.text || beforeClose.size !== expected.size || beforeClose.lastModified !== expected.lastModified) {
+      if (typeof writable.abort === 'function') await writable.abort();
+      writable = null;
+      saveProblem('保存中にファイルが外部で変更されたため、上書きを中止しました。必要なら別名で保存し、元ファイルを確認してください。');
+      return;
+    }
+    await writable.close();
+    writable = null;
+    const writtenFile = await handle.getFile(), actual = await writtenFile.text();
+    if (actual !== text) throw new Error('保存後の内容を確認できませんでした。');
+    fileRevision = { text: actual, size: writtenFile.size, lastModified: writtenFile.lastModified };
+    savedSnapshot = writtenSnapshot;
+    notice(dirty() ? '上書き保存しました。保存後の変更は未保存です。' : '上書き保存しました。');
+  } catch (error) {
+    if (writable && typeof writable.abort === 'function') { try { await writable.abort(); } catch {} }
+    if (error?.name !== 'AbortError') saveProblem('上書き保存を完了できませんでした。保存先を確認するか、別名で保存してください。');
+    else notice('上書き保存を取り消しました。');
+  } finally {
+    saveInProgress = false; updateControls();
+  }
+}
+$('overwrite').addEventListener('click', overwriteFile);
 $('save').addEventListener('click', () => {
-  if (!doc) return;
+  if (!doc || saveInProgress || openInProgress) return;
   if (inlineDraft) finishInlineDraft();
   const text = serializeMap(doc), blob = new Blob([text], { type: 'application/json;charset=utf-8' });
   const url = URL.createObjectURL(blob), link = document.createElement('a');
@@ -510,7 +732,7 @@ $('zoom-in').addEventListener('click', () => zoom(1.2)); $('zoom-out').addEventL
 window.addEventListener('beforeunload', event => { if (dirty()) { event.preventDefault(); event.returnValue = ''; } });
 window.addEventListener('keydown', event => {
   if (event.key === 'Escape' && pointer) { event.preventDefault(); clearDrag(); return; }
-  if (event.isComposing || $('edit-dialog').open || !doc) return;
+  if (event.isComposing || $('edit-dialog').open || !doc || openInProgress) return;
   const meta = event.ctrlKey || event.metaKey;
   if (meta && event.key.toLowerCase() === 'z') { event.preventDefault(); event.shiftKey ? redo() : undo(); }
   else if (meta && event.key.toLowerCase() === 'y') { event.preventDefault(); redo(); }

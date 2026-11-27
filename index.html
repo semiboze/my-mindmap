@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>マイ・マインドマップ</title>
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./style.css?v=20261127-1">
 </head>
 <body>
   <header class="app-header">
@@ -16,7 +16,8 @@
     <div class="header-actions">
       <button id="open" class="button button-quiet">ファイルを開く</button>
       <input id="file" type="file" hidden>
-      <button id="save" class="button button-primary" disabled>別名で保存</button>
+      <button id="overwrite" class="button button-primary" title="開いたファイルに上書き保存" disabled>上書き保存</button>
+      <button id="save" class="button button-quiet" disabled>別名で保存</button>
     </div>
   </header>
 
@@ -34,13 +35,13 @@
         <p class="tip">ノードをドラッグして別のノードに重ねると、その子になります。枝の間に置くと順序を変更できます。</p>
         <p class="tip">新しいノードはその場で入力できます。Enterで確定、Shift+Enterで改行、Escで取り消します。</p>
         <p class="tip">背景をドラッグすると画面を移動できます。</p>
-        <div class="privacy-note"><span>✓</span><p>ファイルはこの画面で処理します。元ファイルは上書きしません。</p></div>
+        <div class="privacy-note"><span>✓</span><p>ファイルはこの画面で処理します。上書きするにはブラウザの許可が必要です。</p></div>
       </aside>
 
       <section class="map-panel" aria-label="マインドマップ">
         <div id="canvas" class="canvas" tabindex="0" aria-label="マインドマップの表示領域">
           <div id="world" class="world"><svg id="lines" class="lines" aria-hidden="true"></svg><div id="nodes"></div></div>
-          <div id="empty" class="empty-state"><div class="empty-art"><span>✳</span></div><h1>考えを、ここから広げよう。</h1><p>MindMupファイルを開くと、<br>枝を見ながら編集できます。</p><button id="open-empty" class="button button-primary">ファイルを開く <span>↗</span></button><small>元のファイルは上書きしません</small></div>
+          <div id="empty" class="empty-state"><div class="empty-art"><span>✳</span></div><h1>考えを、ここから広げよう。</h1><p>MindMupファイルを開くと、<br>枝を見ながら編集できます。</p><button id="open-empty" class="button button-primary">ファイルを開く <span>↗</span></button><small>上書き保存と別名保存に対応</small></div>
         </div>
         <div class="canvas-footer"><span id="hint">ファイルを開いて始めましょう</span><div class="zoom-controls"><button id="zoom-out" aria-label="縮小" title="縮小">−</button><span id="zoom-label">100%</span><button id="zoom-in" aria-label="拡大" title="拡大">＋</button><span class="zoom-separator"></span><button id="fit" title="全体表示">全体表示</button></div></div>
       </section>
@@ -48,6 +49,6 @@
   </main>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><div class="dialog-header"><div><span class="eyebrow">EDIT NODE</span><h2 id="dialog-title">文字を編集</h2></div><button type="button" id="close-dialog" class="icon-button" aria-label="閉じる">×</button></div><label for="title-input">ノードの文字</label><textarea id="title-input" rows="5"></textarea><p>タグのような文字も、そのまま表示・保存します。</p><div class="dialog-actions"><button type="button" id="cancel-dialog" class="button button-quiet">キャンセル</button><button type="submit" class="button button-primary">保存</button></div></form></dialog>
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=20261127-1"></script>
 </body>
 </html>
